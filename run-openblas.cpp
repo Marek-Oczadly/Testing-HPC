@@ -5,6 +5,9 @@
 // so the checksums of the two programs can be compared.
 //
 // Build:  g++ -O3 -std=c++17 -o run-openblas run-openblas.cpp -lopenblas
+// ILP64 builds (64-bit ints, symbols suffixed with "64_", e.g. libopenblas64_ on some clusters):
+//         g++ -O3 -std=c++17 -DBLAS_ILP64 -o run-openblas run-openblas.cpp -lopenblas64_
+//         (use -lopenblas64 if that is the library name; check with `ls $(dirname $(which ...))` or the module's lib dir)
 // Threads: OPENBLAS_NUM_THREADS=<n> ./run-openblas   (defaults to all cores; match your Slurm allocation)
 
 #include <chrono>
@@ -14,10 +17,18 @@
 
 #include <cblas.h>
 
+// ILP64 OpenBLAS only declares the suffixed names (cblas_sgemm64_, ...)
+#ifdef BLAS_ILP64
+#define BLAS_FN(name) name##64_
+#else
+#define BLAS_FN(name) name
+#endif
+
 int main()
 {
-    printf("OpenBLAS: %s\n", openblas_get_config());
-    printf("Core: %s, threads: %d\n", openblas_get_corename(), openblas_get_num_threads());
+    printf("OpenBLAS: %s\n", BLAS_FN(openblas_get_config)());
+    printf("Core: %s, threads: %d\n", BLAS_FN(openblas_get_corename)(),
+           (int)BLAS_FN(openblas_get_num_threads)());
 
     const int M = 4096, N = 4096, K = 4096;
     const size_t nA = (size_t)M * K, nB = (size_t)K * N, nC = (size_t)M * N;
@@ -30,7 +41,7 @@ int main()
     const float alpha = 1.0f, beta = 0.0f;
 
     auto gemm = [&]() {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K,
+        BLAS_FN(cblas_sgemm)(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K,
                     alpha, A.data(), K, B.data(), N, beta, C.data(), N);
     };
 
