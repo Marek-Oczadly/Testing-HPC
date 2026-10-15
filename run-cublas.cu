@@ -1,13 +1,14 @@
-// cuBLAS TF32 GEMM benchmark: C = A * B, 4096 x 4096 x 4096, FP32 storage, TF32 Tensor Core compute.
+// cuBLAS TF32 GEMM benchmark: C = A * B for square sizes N = 128, 1024, 2048, 4096, 8192.
 //
 // FP32 inputs/outputs are kept in memory; cublasGemmEx with CUBLAS_COMPUTE_32F_FAST_TF32 lets
 // the Tensor Cores round operands to TF32 (10-bit mantissa) and accumulate in FP32.
-// Matrices are row-major and filled identically to run-openblas.cpp (srand(42), same order),
-// so the checksums of the two programs can be compared.
+// Matrices are row-major and filled identically to run-openblas.cpp (srand(42) per size, same
+// order), so the checksums of the two programs can be compared.
 //
 // Build:  nvcc -arch=sm_90 -O3 -std=c++17 -o run-cublas run-cublas.cu -lcublas
 // (sm_90 = H100; use sm_80 for A100, etc.)
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -35,6 +36,70 @@
         }                                                                         \
     } while (0)
 
+// Square GEMM of size n x n x n; prints one result line.
+static void bench(cublasHandle_t handle, int n)
+{
+    const size_t elems = (size_t)n * n;
+
+    std::vector<float> hA(elems), hB(elems), hC(elems);
+    srand(42);
+    for (auto& v : hA) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
+    for (auto& v : hB) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
+
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dB, elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dC, elems * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(dA, hA.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, hB.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(dC, 0, elems * sizeof(float)));
+
+    const float alpha = 1.0f, beta = 0.0f;
+
+    // cuBLAS is column-major. A row-major C = A*B is the column-major C^T = B^T * A^T,
+    // so pass B first and A second; the buffers are then read/written as row-major C.
+    auto gemm = [&]() {
+        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                  &alpha,
+                                  dB, CUDA_R_32F, n,
+                                  dA, CUDA_R_32F, n,
+                                  &beta,
+                                  dC, CUDA_R_32F, n,
+                                  CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT));
+    };
+
+    // Warm-up (cuBLAS init, heuristics, clocks), then time
+    const int warmup = 3;
+    for (int i = 0; i < warmup; ++i) gemm();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // More iterations for small sizes so the timed region is not dominated by noise
+    const double flops = 2.0 * n * (double)n * n;
+    const int iters = std::max(5, std::min(1000, (int)(2e13 / flops)));
+
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+    CUDA_CHECK(cudaEventRecord(t0));
+    for (int i = 0; i < iters; ++i) gemm();
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float ms = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    ms /= iters;
+
+    // Checksum for a coarse cross-check against run-openblas (FP32 vs TF32 will differ slightly)
+    CUDA_CHECK(cudaMemcpy(hC.data(), dC, elems * sizeof(float), cudaMemcpyDeviceToHost));
+    double sum = 0.0;
+    for (float v : hC) sum += v;
+
+    printf("%5d | %4d iters | %10.3f ms | %10.1f GFLOP/s | checksum %.6f\n", n, iters, ms,
+           flops / (ms * 1e6), sum);
+
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+}
+
 int main()
 {
     int dev = 0;
@@ -48,67 +113,13 @@ int main()
         return EXIT_FAILURE;
     }
 
-    const int M = 4096, N = 4096, K = 4096;
-    const size_t nA = (size_t)M * K, nB = (size_t)K * N, nC = (size_t)M * N;
-
-    std::vector<float> hA(nA), hB(nB), hC(nC);
-    srand(42);
-    for (auto& v : hA) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
-    for (auto& v : hB) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
-
-    float *dA, *dB, *dC;
-    CUDA_CHECK(cudaMalloc(&dA, nA * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dB, nB * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dC, nC * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(dA, hA.data(), nA * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dB, hB.data(), nB * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(dC, 0, nC * sizeof(float)));
-
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
 
-    const float alpha = 1.0f, beta = 0.0f;
-
-    // cuBLAS is column-major. A row-major C = A*B is the column-major C^T = B^T * A^T,
-    // so pass B first and A second; the buffers are then read/written as row-major C.
-    auto gemm = [&]() {
-        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K,
-                                  &alpha,
-                                  dB, CUDA_R_32F, N,
-                                  dA, CUDA_R_32F, K,
-                                  &beta,
-                                  dC, CUDA_R_32F, N,
-                                  CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT));
-    };
-
-    // Warm-up (cuBLAS init, heuristics, clocks), then time
-    const int warmup = 3;
-    for (int i = 0; i < warmup; ++i) gemm();
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    const int iters = 20;
-    cudaEvent_t t0, t1;
-    CUDA_CHECK(cudaEventCreate(&t0));
-    CUDA_CHECK(cudaEventCreate(&t1));
-    CUDA_CHECK(cudaEventRecord(t0));
-    for (int i = 0; i < iters; ++i) gemm();
-    CUDA_CHECK(cudaEventRecord(t1));
-    CUDA_CHECK(cudaEventSynchronize(t1));
-    float ms = 0;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
-    ms /= iters;
-
-    printf("cublasGemmEx TF32 %dx%dx%d: %.3f ms, %.1f GFLOP/s\n", M, N, K, ms,
-           2.0 * M * N * K / (ms * 1e6));
-
-    // Checksum for a coarse cross-check against run-openblas (FP32 vs TF32 will differ slightly)
-    CUDA_CHECK(cudaMemcpy(hC.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
-    double sum = 0.0;
-    for (float v : hC) sum += v;
-    printf("Checksum (sum of C): %.6f\n", sum);
+    printf("cublasGemmEx TF32 (FP32 storage), square N x N x N\n");
+    const int sizes[] = {128, 1024, 2048, 4096, 8192};
+    for (int n : sizes) bench(handle, n);
 
     CUBLAS_CHECK(cublasDestroy(handle));
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
     return EXIT_SUCCESS;
 }

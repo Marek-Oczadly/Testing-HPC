@@ -1,8 +1,8 @@
-// OpenBLAS SGEMM benchmark: C = A * B, 4096 x 4096 x 4096, FP32 on the CPU.
+// OpenBLAS SGEMM benchmark: C = A * B for square sizes N = 128, 1024, 2048, 4096, 8192, FP32 on the CPU.
 //
 // CPU baseline for run-cublas.cu. OpenBLAS has no TF32, so this is a full FP32 SGEMM.
-// Matrices are row-major and filled identically to run-cublas.cu (srand(42), same order),
-// so the checksums of the two programs can be compared.
+// Matrices are row-major and filled identically to run-cublas.cu (srand(42) per size, same
+// order), so the checksums of the two programs can be compared.
 //
 // Build:  g++ -O3 -std=c++17 -o run-openblas run-openblas.cpp -lopenblas
 // ILP64 builds (64-bit ints, symbols suffixed with "64_", e.g. libopenblas64_ on some clusters):
@@ -10,6 +10,7 @@
 //         (use -lopenblas64 if that is the library name; check with `ls $(dirname $(which ...))` or the module's lib dir)
 // Threads: OPENBLAS_NUM_THREADS=<n> ./run-openblas   (defaults to all cores; match your Slurm allocation)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -24,16 +25,12 @@
 #define BLAS_FN(name) name
 #endif
 
-int main()
+// Square SGEMM of size n x n x n; prints one result line.
+static void bench(int n)
 {
-    printf("OpenBLAS: %s\n", BLAS_FN(openblas_get_config)());
-    printf("Core: %s, threads: %d\n", BLAS_FN(openblas_get_corename)(),
-           (int)BLAS_FN(openblas_get_num_threads)());
+    const size_t elems = (size_t)n * n;
 
-    const int M = 4096, N = 4096, K = 4096;
-    const size_t nA = (size_t)M * K, nB = (size_t)K * N, nC = (size_t)M * N;
-
-    std::vector<float> A(nA), B(nB), C(nC, 0.0f);
+    std::vector<float> A(elems), B(elems), C(elems, 0.0f);
     srand(42);
     for (auto& v : A) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
     for (auto& v : B) v = rand() / (float)RAND_MAX * 2.0f - 1.0f;
@@ -41,26 +38,39 @@ int main()
     const float alpha = 1.0f, beta = 0.0f;
 
     auto gemm = [&]() {
-        BLAS_FN(cblas_sgemm)(CblasRowMajor, CblasNoTrans, CblasNoTrans, M, N, K,
-                    alpha, A.data(), K, B.data(), N, beta, C.data(), N);
+        BLAS_FN(cblas_sgemm)(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n,
+                             alpha, A.data(), n, B.data(), n, beta, C.data(), n);
     };
 
     // Warm-up (thread pool start-up, page faults on C), then time
     const int warmup = 1;
     for (int i = 0; i < warmup; ++i) gemm();
 
-    const int iters = 5;
+    // More iterations for small sizes so the timed region is not dominated by noise
+    const double flops = 2.0 * n * (double)n * n;
+    const int iters = std::max(3, std::min(200, (int)(1e12 / flops)));
+
     auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < iters; ++i) gemm();
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 
-    printf("cblas_sgemm FP32 %dx%dx%d: %.3f ms, %.1f GFLOP/s\n", M, N, K, ms,
-           2.0 * M * N * K / (ms * 1e6));
-
     double sum = 0.0;
     for (float v : C) sum += v;
-    printf("Checksum (sum of C): %.6f\n", sum);
+
+    printf("%5d | %4d iters | %10.3f ms | %10.1f GFLOP/s | checksum %.6f\n", n, iters, ms,
+           flops / (ms * 1e6), sum);
+}
+
+int main()
+{
+    printf("OpenBLAS: %s\n", BLAS_FN(openblas_get_config)());
+    printf("Core: %s, threads: %d\n", BLAS_FN(openblas_get_corename)(),
+           (int)BLAS_FN(openblas_get_num_threads)());
+
+    printf("cblas_sgemm FP32, square N x N x N\n");
+    const int sizes[] = {128, 1024, 2048, 4096, 8192};
+    for (int n : sizes) bench(n);
 
     return EXIT_SUCCESS;
 }
